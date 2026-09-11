@@ -14,6 +14,7 @@ import unicodedata
 from collections.abc import AsyncGenerator
 from io import BytesIO
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import requests
 from PIL import Image as PILImage
@@ -153,7 +154,7 @@ def _load_binary_from_path(
         )
         return response.content, mime_type, _basename_from_url(path)
 
-    normalized = path[8:] if path.startswith("file:///") else path
+    normalized = unquote(urlsplit(path).path) if path.startswith("file:///") else path
     with open(normalized, "rb") as handle:
         data = handle.read()
     return (

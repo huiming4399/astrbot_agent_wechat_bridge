@@ -110,6 +110,18 @@ def _load_event_module():
     return importlib.import_module("src.agent_wechat_event")
 
 
+def test_load_binary_from_file_uri_with_chinese_path(tmp_path):
+    module = _load_event_module()
+    image = tmp_path / "桌面 表情包" / "测试.jpg"
+    image.parent.mkdir()
+    image.write_bytes(b"test-image")
+
+    assert module._load_binary_from_path(image.as_uri()) == (
+        b"test-image", "image/jpeg", "测试.jpg"
+    )
+    assert module._load_binary_from_path(str(image))[0] == b"test-image"
+
+
 def test_build_send_payloads_expands_nodes_in_original_order():
     module = _load_event_module()
     chain = module.MessageChain(

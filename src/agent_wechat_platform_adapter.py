@@ -895,23 +895,24 @@ class AgentWeChatPlatformAdapter(Platform):
             leading_self_mention = is_leading_self_mention(
                 raw_text, self.self_aliases
             )
-        if is_group and not should_wake_group_message(
-            sender_id=sender_id,
-            mentioned=mentioned,
-            leading_self_mention=leading_self_mention,
-            mention_free_senders=self.group_mention_free_senders,
-        ):
-            # 群里既没 @ 机器人、又不在免@名单里的消息，直接忽略，不交给 AstrBot。
-            logger.info(
-                f"[agent_wechat] 群聊消息未 @ 机器人且发送者不在免@名单，已忽略 "
-                f"chat={chat_id} sender={sender_id}"
+        # 群聊里只有「被 @」或「发送者在免@名单里」才注入 At(self_id)。
+        # AstrBot 的 process_stage 只会在 is_at_or_wake_command 为真时调用大模型，
+        # 所以不注入 At 的消息不会触发回复，但仍会流经 AstrBot（群聊上下文照常记录）。
+        mentions_bot = mentioned or leading_self_mention
+        if is_group:
+            is_mentioned = should_wake_group_message(
+                sender_id=sender_id,
+                mentioned=mentioned,
+                leading_self_mention=leading_self_mention,
+                mention_free_senders=self.group_mention_free_senders,
             )
-            return None
-        # 能走到这里说明群消息已经通过唤醒判定（被 @ 或发送者在免@名单里），
-        # 统一按“已唤醒”处理，交给 AstrBot 继续走对话链路。
-        is_mentioned = is_group or mentioned or leading_self_mention
+        else:
+            is_mentioned = True
+        # 只有真正 @ 了机器人时才把开头的 @ 去掉，其余消息保留原文，便于上下文还原。
         normalized_text = (
-            strip_leading_mentions(raw_text) if is_group else raw_text.strip()
+            strip_leading_mentions(raw_text)
+            if is_group and mentions_bot
+            else raw_text.strip()
         )
 
         components: list[Any] = []

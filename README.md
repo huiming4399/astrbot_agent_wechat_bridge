@@ -10,7 +10,8 @@
 - `POST /api/chats/{id}/open`：打开会话并清除未读
 - `GET /api/messages/{id}`：拉取新消息
 - `GET /api/messages/{id}/media/{localId}`：下载媒体附件
-- `POST /api/messages/send`：发送回复
+- `POST /api/messages/send`：发送回复（非文本消息）
+- `GET /api/debug/a11y`：读取微信窗口无障碍树，供 X11 发送通道定位控件
 
 ## 架构图
 
@@ -83,6 +84,24 @@ AstrBot 加载插件后，在平台管理中添加 `agent_wechat`，配置项如
 | --- | --- | --- |
 | `server_url` | `http://localhost:6174` | `agent-wechat` REST API 地址 |
 | `token` | 空 | 如果服务开启鉴权，填写 Bearer Token |
+| `enable_x11_send_fallback` | `true` | 是否启用容器内 X11 发送通道 |
+| `x11_send_mode` | `always` | `always`：文本消息直接走 X11；`fallback`：先试接口，失败后再走 X11 |
+| `x11_docker_container` | `agent-wechat` | 运行微信的容器名称 |
+| `x11_display` | `:99` | 容器内的 X 显示编号 |
+
+### 关于发送通道
+
+上游 `agent-wechat` 的动作规划层在部分微信版本下会持续返回 `No action selected`，导致
+`POST /api/messages/send` 完全不可用（上游 issue #169 / #170 / #171 / #173）。此时收消息一切正常，
+但机器人回复发不出去。
+
+为此本插件新增了绕过规划层的发送通道：直接用容器内的 `xdotool` + `xclip` 操作微信窗口
+（点击会话 → 粘贴文本 → 点击发送按钮），并用无障碍树校验发送结果。
+
+- 需要容器内存在 `xdotool`、`xclip`，且宿主机当前用户能执行 `docker exec`（必要时加入 `docker` 组）
+- 默认 `x11_send_mode=always`，即文本消息不再尝试已知不可用的接口
+- 图片/文件/语音等非文本消息仍然走接口
+- 若上游修复了 `send` 接口，可把 `x11_send_mode` 改成 `fallback` 或关闭 `enable_x11_send_fallback`
 
 插件内置固定策略（无需配置）：
 
@@ -118,6 +137,10 @@ AstrBot 加载插件后，在平台管理中添加 `agent_wechat`，配置项如
   - 本插件已内置低延迟参数；若仍有明显延迟，优先检查 `agent-wechat` 侧 `open_chat` 调用是否耗时异常
 - 发送后想看是否收到了：
   - 查看 AstrBot 日志中的 `[agent_wechat] inbound accepted ...`
+- 日志里能收到消息、大模型也回复了，但微信里看不到消息：
+  - 若之前出现 `No action selected`，说明命中了上游 `send` 接口缺陷；确认 `x11_send_mode=always`
+  - 检查日志里是否出现 `[agent_wechat][send] X11 发送成功`
+  - 检查微信是否掉回登录页：`curl -H "Authorization: Bearer $TOKEN" http://localhost:6174/api/status/auth`
 
 ## 实现细节
 
@@ -127,6 +150,7 @@ AstrBot 加载插件后，在平台管理中添加 `agent_wechat`，配置项如
 - 针对媒体准备延迟，下载逻辑带有重试机制
 - 当消息数据库写入晚于未读状态变化时，会用 `lastMsgLocalId` 做补偿轮询
 - 当前上游的 `/api/ws/events` 路由已经存在，但实时消息广播仍未完全接通，所以插件保留 REST 补偿同步以保证稳定性
+- 文本发送默认走容器内 X11 自动化，非文本消息仍走 `POST /api/messages/send`
 - 由于 `agent-wechat` 没有原生的微信 `@` 发送接口，AstrBot 的 `At` 组件会降级为普通文本
 
 ## 更新日志

@@ -2,6 +2,17 @@
 
 本项目遵循“每次版本更新都记录变更”的约定。
 
+## 0.3.20 - 2026-09-12
+
+- 修复“微信可以收到消息、AstrBot 也生成了回复，但消息发不出去”的问题
+- 根因是上游 `agent-wechat` 的动作规划层在部分微信版本下持续返回 `No action selected`（上游 issue #169/#170/#171/#173），`POST /api/messages/send` 与 `wx chats open` 均不可用
+- 新增 `src/agent_wechat_x11.py`：绕过规划层，直接用容器内 `xdotool` + `xclip` 操作微信窗口发送文本消息
+- 新增配置项：`x11_send_mode`（默认 `always`，文本消息直接走 X11，跳过已知不可用的接口；`fallback` 为先试接口再兜底）、`enable_x11_send_fallback`、`x11_docker_container`、`x11_display`
+- `fallback` 模式下接口失败会触发熔断，短时间内不再重试接口，避免每次发送都白等重试
+- 发送耗时从约 `19.7s` 优化到约 `2.6s`：去掉阻塞的 `xdotool mousemove --sync`，并让 `xclip` 脱离 `docker exec` 管道
+- 新增 `GET /api/debug/a11y` 客户端封装（`WeChatClient.debug_a11y`）
+- 补充发送链路路由单测（`tests/test_agent_wechat_x11_send.py`）
+
 ## 0.3.18 - 2026-03-27
 
 - 修复“掉线重连后回灌离线消息”的问题

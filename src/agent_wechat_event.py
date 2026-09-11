@@ -39,9 +39,17 @@ SEND_LOG_PREFIX = "[agent_wechat][send]"
 SEND_RECOVERY_RETRY_ATTEMPTS = 3
 SEND_RECOVERY_RETRY_INTERVAL_SECONDS = 1.0
 SEND_RECOVERY_ERRORS = {"No action selected"}
+X11_SEND_MODE_ALWAYS = "always"
+X11_SEND_MODE_FALLBACK = "fallback"
+SEND_API_FAILURE_THRESHOLD = 1
+SEND_API_FAILURE_COOLDOWN_SECONDS = 600.0
 IGNORED_SERIALIZED_SEG_TYPES = {"reply"}
 MAX_FILENAME_LENGTH = 96
 OUTBOUND_IMAGE_DEDUP_WINDOW_SECONDS = 8.0
+
+
+class RecoverableSendError(RuntimeError):
+    """接口返回可恢复错误（例如 No action selected），可交给兜底通道重试。"""
 
 
 def _component_type_name(component: Any) -> str:
@@ -541,62 +549,161 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
             return
 
         for idx, payload in enumerate(filtered_payloads):
-            recovered = False
-            for attempt in range(1, SEND_RECOVERY_RETRY_ATTEMPTS + 1):
-                try:
-                    result = await asyncio.to_thread(
-                        client.send_message,
-                        payload,
-                        timeout=SEND_REQUEST_TIMEOUT_SECONDS,
-                    )
-                except requests.exceptions.ReadTimeout as exc:
-                    logger.exception(
-                        f"{SEND_LOG_PREFIX} send payload timeout "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)}"
-                    )
-                    raise RuntimeError(
-                        "agent-wechat 发送超时（30秒未响应），"
-                        "请检查微信客户端是否卡在聊天切换/自动化操作中。"
-                    ) from exc
-                except requests.exceptions.RequestException as exc:
-                    logger.exception(
-                        f"{SEND_LOG_PREFIX} send payload request error "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)}"
-                    )
-                    raise RuntimeError(f"agent-wechat 发送请求失败: {exc}") from exc
+            sender = getattr(client, "x11_sender", None)
+            text = payload.get("text")
+            total = len(filtered_payloads)
+            can_use_x11 = sender is not None and isinstance(text, str) and text != ""
+            mode = str(
+                getattr(client, "x11_send_mode", X11_SEND_MODE_ALWAYS) or ""
+            )
+            x11_first = can_use_x11 and mode != X11_SEND_MODE_FALLBACK
 
-                if result.get("success", True):
-                    recovered = True
-                    break
-
-                error = str(result.get("error") or "")
-                recoverable = error in SEND_RECOVERY_ERRORS
-                if recoverable and attempt < SEND_RECOVERY_RETRY_ATTEMPTS:
-                    logger.warning(
-                        f"{SEND_LOG_PREFIX} recoverable send error "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} "
-                        f"attempt={attempt}/{SEND_RECOVERY_RETRY_ATTEMPTS} "
-                        f"error={error}; trying open_chat and retry"
-                    )
-                    try:
-                        await asyncio.to_thread(client.open_chat, chat_id, False)
-                    except Exception as exc:
-                        logger.warning(
-                            f"{SEND_LOG_PREFIX} open_chat before retry failed "
-                            f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} error={exc}"
-                        )
-                    await asyncio.sleep(SEND_RECOVERY_RETRY_INTERVAL_SECONDS)
-                    continue
-
-                logger.error(
-                    f"{SEND_LOG_PREFIX} send payload failed "
-                    f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} "
-                    f"error={error}"
+            if x11_first:
+                await cls._send_payload_via_x11(
+                    sender, client, chat_id, text, idx, total
                 )
-                raise RuntimeError(error or "agent-wechat 发送失败")
+                continue
 
-            if not recovered:
-                raise RuntimeError("agent-wechat 发送失败：重试后仍失败")
+            api_error: RecoverableSendError | None = None
+            if not (can_use_x11 and cls._should_skip_api()):
+                try:
+                    await cls._send_payload_via_api(client, chat_id, payload, idx, total)
+                    cls._note_api_success()
+                    continue
+                except RecoverableSendError as exc:
+                    api_error = exc
+                    if can_use_x11:
+                        cls._note_api_failure()
+
+            if not can_use_x11:
+                raise RuntimeError(
+                    str(api_error) if api_error else "agent-wechat 发送失败"
+                )
+
+            if api_error is None:
+                logger.warning(
+                    f"{SEND_LOG_PREFIX} 接口发送已知不可用，直接走 X11 兜底发送 "
+                    f"chat={chat_id} idx={idx + 1}/{total}"
+                )
+            else:
+                logger.warning(
+                    f"{SEND_LOG_PREFIX} 接口发送失败（{api_error}），"
+                    f"改用容器内 X11 兜底发送 chat={chat_id} idx={idx + 1}/{total}"
+                )
+            await cls._send_payload_via_x11(sender, client, chat_id, text, idx, total)
+
+    @classmethod
+    async def _send_payload_via_x11(
+        cls,
+        sender: Any,
+        client: WeChatClient,
+        chat_id: str,
+        text: str,
+        idx: int,
+        total: int,
+    ) -> None:
+        """通过容器内 X11 自动化发送单条文本消息。"""
+        try:
+            await asyncio.to_thread(sender.send_text, client, chat_id, text)
+        except Exception as x11_exc:
+            logger.exception(
+                f"{SEND_LOG_PREFIX} X11 发送失败 chat={chat_id} idx={idx + 1}/{total}"
+            )
+            raise RuntimeError(f"X11 发送失败：{x11_exc}") from x11_exc
+        logger.info(
+            f"{SEND_LOG_PREFIX} X11 发送成功 chat={chat_id} idx={idx + 1}/{total}"
+        )
+
+    _api_failure_streak: int = 0
+    _api_failure_at: float = 0.0
+
+    @classmethod
+    def _should_skip_api(cls) -> bool:
+        """接口连续失败后短暂跳过它，避免每次发送都白等重试。"""
+        if cls._api_failure_streak < SEND_API_FAILURE_THRESHOLD:
+            return False
+        return (
+            time.monotonic() - cls._api_failure_at
+        ) < SEND_API_FAILURE_COOLDOWN_SECONDS
+
+    @classmethod
+    def _note_api_failure(cls) -> None:
+        cls._api_failure_streak += 1
+        cls._api_failure_at = time.monotonic()
+
+    @classmethod
+    def _note_api_success(cls) -> None:
+        cls._api_failure_streak = 0
+
+    @classmethod
+    async def _send_payload_via_api(
+        cls,
+        client: WeChatClient,
+        chat_id: str,
+        payload: dict[str, Any],
+        idx: int,
+        total: int,
+    ) -> None:
+        """通过 agent-wechat 接口发送单条内容。
+
+        可恢复错误（例如上游规划层返回的 ``No action selected``）会抛出
+        ``RecoverableSendError``，由调用方切换到 X11 兜底通道。
+        """
+        for attempt in range(1, SEND_RECOVERY_RETRY_ATTEMPTS + 1):
+            try:
+                result = await asyncio.to_thread(
+                    client.send_message,
+                    payload,
+                    timeout=SEND_REQUEST_TIMEOUT_SECONDS,
+                )
+            except requests.exceptions.ReadTimeout as exc:
+                logger.exception(
+                    f"{SEND_LOG_PREFIX} send payload timeout "
+                    f"chat={chat_id} idx={idx + 1}/{total}"
+                )
+                raise RuntimeError(
+                    "agent-wechat 发送超时（30秒未响应），"
+                    "请检查微信客户端是否卡在聊天切换/自动化操作中。"
+                ) from exc
+            except requests.exceptions.RequestException as exc:
+                logger.exception(
+                    f"{SEND_LOG_PREFIX} send payload request error "
+                    f"chat={chat_id} idx={idx + 1}/{total}"
+                )
+                raise RuntimeError(f"agent-wechat 发送请求失败: {exc}") from exc
+
+            if result.get("success", True):
+                return
+
+            error = str(result.get("error") or "")
+            recoverable = error in SEND_RECOVERY_ERRORS
+            if recoverable and attempt < SEND_RECOVERY_RETRY_ATTEMPTS:
+                logger.warning(
+                    f"{SEND_LOG_PREFIX} recoverable send error "
+                    f"chat={chat_id} idx={idx + 1}/{total} "
+                    f"attempt={attempt}/{SEND_RECOVERY_RETRY_ATTEMPTS} "
+                    f"error={error}; trying open_chat and retry"
+                )
+                try:
+                    await asyncio.to_thread(client.open_chat, chat_id, False)
+                except Exception as exc:
+                    logger.warning(
+                        f"{SEND_LOG_PREFIX} open_chat before retry failed "
+                        f"chat={chat_id} idx={idx + 1}/{total} error={exc}"
+                    )
+                await asyncio.sleep(SEND_RECOVERY_RETRY_INTERVAL_SECONDS)
+                continue
+
+            if recoverable:
+                raise RecoverableSendError(error)
+
+            logger.error(
+                f"{SEND_LOG_PREFIX} send payload failed "
+                f"chat={chat_id} idx={idx + 1}/{total} error={error}"
+            )
+            raise RuntimeError(error or "agent-wechat 发送失败")
+
+        raise RecoverableSendError("agent-wechat 发送失败：重试后仍失败")
 
     async def send(self, message: MessageChain) -> None:
         await self.send_message_chain(self.client, self.chat_id, message)

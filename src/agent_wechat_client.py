@@ -116,6 +116,11 @@ class WeChatClient:
     def auth_status(self) -> dict[str, Any]:
         return self._get("/api/status/auth")
 
+    def debug_a11y(self) -> dict[str, Any]:
+        """读取微信窗口的无障碍树（agent-wechat 调试接口）。"""
+        result = self._get("/api/debug/a11y")
+        return result if isinstance(result, dict) else {}
+
     def login(self) -> dict[str, Any]:
         return self._post("/api/status/login")
 

@@ -38,6 +38,7 @@ from .agent_wechat_client import (
     WeChatEventWebSocketClient,
 )
 from .agent_wechat_event import AgentWeChatMessageEvent
+from .agent_wechat_x11 import X11Sender
 
 MSG_TYPE_TEXT = 1
 MSG_TYPE_IMAGE = 3
@@ -79,12 +80,43 @@ CONFIG_METADATA = {
             "field_type": "str",
             "secret": True,
         },
+        "enable_x11_send_fallback": {
+            "label": "X11 兜底发送",
+            "help_text": (
+                "agent-wechat 接口返回 No action selected 时，"
+                "改用容器内 xdotool/xclip 直接发送文本消息。"
+            ),
+            "field_type": "bool",
+        },
+        "x11_send_mode": {
+            "label": "X11 发送模式",
+            "help_text": (
+                "always：文本消息直接走容器内 xdotool 发送，跳过已知不可用的接口；"
+                "fallback：先试接口，失败后再用 xdotool。"
+            ),
+            "field_type": "str",
+            "options": ["always", "fallback"],
+        },
+        "x11_docker_container": {
+            "label": "微信容器名",
+            "help_text": "运行微信的 agent-wechat 容器名称，默认 agent-wechat。",
+            "field_type": "str",
+        },
+        "x11_display": {
+            "label": "容器内 DISPLAY",
+            "help_text": "容器内 X 显示编号，默认 :99。",
+            "field_type": "str",
+        },
     }
 }
 
 DEFAULT_CONFIG = {
     "server_url": "http://localhost:6174",
     "token": "",
+    "enable_x11_send_fallback": True,
+    "x11_send_mode": "always",
+    "x11_docker_container": "agent-wechat",
+    "x11_display": ":99",
 }
 
 
@@ -172,6 +204,16 @@ class AgentWeChatPlatformAdapter(Platform):
             base_url=str(self.config["server_url"]),
             token=str(self.config.get("token") or "") or None,
         )
+        if bool(self.config.get("enable_x11_send_fallback", True)):
+            self.client.x11_sender = X11Sender(
+                container=str(self.config.get("x11_docker_container") or "agent-wechat"),
+                display=str(self.config.get("x11_display") or ":99"),
+            )
+        else:
+            self.client.x11_sender = None
+        self.client.x11_send_mode = str(
+            self.config.get("x11_send_mode") or "always"
+        ).strip() or "always"
         self.shutdown_event = asyncio.Event()
         self.sync_event = asyncio.Event()
         self.last_seen_id: dict[str, int] = {}

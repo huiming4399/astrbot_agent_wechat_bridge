@@ -148,6 +148,7 @@ class X11Sender:
         self.container = (container or DEFAULT_CONTAINER).strip()
         self.display = (display or DEFAULT_DISPLAY).strip()
         self._display_name_cache: dict[str, str] = {}
+        self._active_chat_id: str | None = None
 
     # ------------------------------------------------------------------ 底层
 
@@ -274,6 +275,11 @@ class X11Sender:
         return None
 
     def _ensure_chat_open(self, client: Any, chat_id: str) -> None:
+        # A decorated reply can send text and an image back-to-back.  WeChat
+        # may refresh the chat list between those sends and temporarily omit
+        # the just-selected group; retain the confirmed selection locally.
+        if self._active_chat_id == chat_id:
+            return
         display_name = self._resolve_display_name(client, chat_id)
         if not display_name:
             raise X11SendError(f"无法解析会话 {chat_id} 的显示名称")
@@ -314,6 +320,7 @@ class X11Sender:
                     f"会话列表里找不到「{display_name}」，它可能不在可视区域内"
                 )
             if _has_state(target, "SELECTED"):
+                self._active_chat_id = chat_id
                 return
             point = _center(target.get("bounds"))
             if point is None:

@@ -271,6 +271,31 @@ class X11Sender:
             if not items:
                 raise X11SendError("无障碍树里没有会话列表，微信窗口状态异常")
             target = match_chat_item(items, display_name)
+            # Newly joined/group chats may be returned by agent-wechat with the
+            # raw ``@chatroom`` id instead of their display name.  WeChat's
+            # visible row still contains the latest message preview, so use it
+            # as a stable secondary locator.
+            if target is None and chat_id.endswith("@chatroom"):
+                try:
+                    messages = client.list_messages(chat_id, limit=8)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        f"{X11_LOG_PREFIX} list group messages failed chat={chat_id}: {exc}"
+                    )
+                    messages = []
+                previews = [
+                    str(message.get("content") or "").strip()
+                    for message in reversed(messages)
+                    if isinstance(message, dict)
+                ]
+                previews = [preview for preview in previews if preview]
+                matches = [
+                    item
+                    for item in items
+                    if any(preview in str(item.get("name") or "") for preview in previews)
+                ]
+                if len(matches) == 1:
+                    target = matches[0]
             if target is None:
                 raise X11SendError(
                     f"会话列表里找不到「{display_name}」，它可能不在可视区域内"

@@ -22,6 +22,7 @@ X11_LOG_PREFIX = "[agent_wechat][x11]"
 DEFAULT_CONTAINER = "agent-wechat"
 DEFAULT_DISPLAY = ":99"
 CONTAINER_TEXT_PATH = "/tmp/astrbot_outbound.txt"
+CONTAINER_IMAGE_PATH = "/tmp/astrbot_outbound_image"
 
 STEP_TIMEOUT_SECONDS = 30.0
 A11Y_RETRY_ATTEMPTS = 12
@@ -201,6 +202,18 @@ class X11Sender:
             detail = (result.stderr or result.stdout or "").strip()
             raise X11SendError(f"拷贝待发送文本失败: {detail[:200]}")
 
+    def _copy_binary_into_container(self, host_path: str, container_path: str) -> None:
+        command = ["sg", "docker", "-c", f"docker cp {shlex.quote(host_path)} "
+                   f"{shlex.quote(self.container)}:{shlex.quote(container_path)}"]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=STEP_TIMEOUT_SECONDS)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise X11SendError(f"拷贝待发送图片失败: {exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise X11SendError(f"拷贝待发送图片失败: {detail[:200]}")
+
     def _a11y(self, client: Any) -> dict[str, Any]:
         try:
             payload = client.debug_a11y()
@@ -370,6 +383,43 @@ class X11Sender:
 
             if not self._wait_send_button(client, disabled=True):
                 raise X11SendError("点击发送后输入框未清空，消息可能没有发出去")
+        finally:
+            if host_path:
+                try:
+                    os.unlink(host_path)
+                except OSError:
+                    pass
+
+    def send_image(self, client: Any, chat_id: str, image: dict[str, Any]) -> None:
+        """在容器内把图片粘贴到当前微信会话并发送。"""
+        encoded = image.get("data")
+        mime = str(image.get("mimeType") or "image/png")
+        if not isinstance(encoded, str) or not encoded:
+            raise X11SendError("图片数据为空")
+        import base64
+        host_path = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", suffix=".img", delete=False) as handle:
+                handle.write(base64.b64decode(encoded))
+                host_path = handle.name
+            self._ensure_chat_open(client, chat_id)
+            pair = self._focus_composer(client)
+            if _has_state(pair[1], "DISABLED") is False:
+                raise X11SendError("微信输入框里仍有未发送的内容")
+            self._copy_binary_into_container(host_path, CONTAINER_IMAGE_PATH)
+            self._exec_script(
+                f"export DISPLAY={shlex.quote(self.display)}\n"
+                f"/opt/tools/paste-image {shlex.quote(CONTAINER_IMAGE_PATH)} {shlex.quote(mime)}\n"
+            )
+            pair = self._wait_send_button(client, disabled=False)
+            if pair is None:
+                raise X11SendError("粘贴图片后发送按钮未激活")
+            point = _center(pair[1].get("bounds"))
+            if point is None:
+                raise X11SendError("发送按钮坐标不可用")
+            self._click(*point)
+            if not self._wait_send_button(client, disabled=True):
+                raise X11SendError("发送图片后输入框未清空")
         finally:
             if host_path:
                 try:

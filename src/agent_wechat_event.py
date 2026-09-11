@@ -552,8 +552,12 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
         for idx, payload in enumerate(filtered_payloads):
             sender = getattr(client, "x11_sender", None)
             text = payload.get("text")
+            is_image = isinstance(payload.get("image"), dict)
             total = len(filtered_payloads)
-            can_use_x11 = sender is not None and isinstance(text, str) and text != ""
+            can_use_x11 = sender is not None and (
+                (isinstance(text, str) and text != "")
+                or (is_image and hasattr(sender, "send_image"))
+            )
             mode = str(
                 getattr(client, "x11_send_mode", X11_SEND_MODE_ALWAYS) or ""
             )
@@ -561,7 +565,7 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
 
             if x11_first:
                 await cls._send_payload_via_x11(
-                    sender, client, chat_id, text, idx, total
+                    sender, client, chat_id, payload, idx, total
                 )
                 continue
 
@@ -591,7 +595,7 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                     f"{SEND_LOG_PREFIX} 接口发送失败（{api_error}），"
                     f"改用容器内 X11 兜底发送 chat={chat_id} idx={idx + 1}/{total}"
                 )
-            await cls._send_payload_via_x11(sender, client, chat_id, text, idx, total)
+            await cls._send_payload_via_x11(sender, client, chat_id, payload, idx, total)
 
     @classmethod
     async def _send_payload_via_x11(
@@ -599,13 +603,16 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
         sender: Any,
         client: WeChatClient,
         chat_id: str,
-        text: str,
+        payload: dict[str, Any],
         idx: int,
         total: int,
     ) -> None:
-        """通过容器内 X11 自动化发送单条文本消息。"""
+        """通过容器内 X11 自动化发送单条文本或图片消息。"""
         try:
-            await asyncio.to_thread(sender.send_text, client, chat_id, text)
+            if isinstance(payload.get("image"), dict):
+                await asyncio.to_thread(sender.send_image, client, chat_id, payload["image"])
+            else:
+                await asyncio.to_thread(sender.send_text, client, chat_id, payload.get("text") or "")
         except Exception as x11_exc:
             logger.exception(
                 f"{SEND_LOG_PREFIX} X11 发送失败 chat={chat_id} idx={idx + 1}/{total}"

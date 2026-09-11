@@ -30,6 +30,7 @@ STEP_TIMEOUT_SECONDS = 30.0
 A11Y_RETRY_ATTEMPTS = 12
 A11Y_RETRY_INTERVAL_SECONDS = 0.12
 STATE_WAIT_ATTEMPTS = 25
+IMAGE_DECODE_WAIT_SECONDS = 1.3
 _SEND_LOCK = threading.RLock()
 
 
@@ -43,6 +44,60 @@ def serialized_send(method):
 
 class X11SendError(RuntimeError):
     """X11 兜底发送失败。"""
+
+
+# 图片气泡里真正图片的位置不固定（左侧带头像、右侧自己发送、不同宽高），
+# 因此在气泡内取多个候选点逐个尝试，点空位置不会产生副作用。
+_IMAGE_CLICK_X_FRACTIONS = (0.22, 0.34, 0.46, 0.62, 0.78)
+_IMAGE_CLICK_Y_FRACTION = 0.55
+_IMAGE_ITEM_NAME_PREFIXES = ("image", "图片", "[photo]")
+
+
+def _image_bubble_points(tree: Any) -> list[tuple[int, int]]:
+    """返回消息列表里图片气泡的候选点击坐标。
+
+    WeChat 只把收到的图片存成加密的 ``.dat``，只有真正渲染过（例如打开图片
+    查看器）才会写出未加密的临时副本。这里定位可见的图片气泡，供调用方逐个
+    点开以触发解码。坐标按“越新的消息越靠前”排序，同一气泡内给出多个候选点。
+    """
+    messages = None
+    for node in _iter_nodes(tree):
+        if node.get("role") == "list" and str(node.get("name") or "").strip() == "Messages":
+            messages = node
+            break
+    if messages is None:
+        return []
+
+    items: list[tuple[float, float, float, float]] = []
+    for node in _iter_nodes(messages):
+        if node.get("role") != "list-item":
+            continue
+        name = str(node.get("name") or "").strip().lower()
+        if not name or not name.startswith(_IMAGE_ITEM_NAME_PREFIXES):
+            continue
+        bounds = node.get("bounds")
+        if not isinstance(bounds, dict):
+            continue
+        try:
+            x = float(bounds.get("x", 0))
+            y = float(bounds.get("y", 0))
+            width = float(bounds.get("width", 0))
+            height = float(bounds.get("height", 0))
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        items.append((x, y, width, height))
+
+    # 最新的消息在列表最下方，优先尝试它。
+    items.sort(key=lambda item: item[1], reverse=True)
+
+    points: list[tuple[int, int]] = []
+    for x, y, width, height in items:
+        click_y = y + height * _IMAGE_CLICK_Y_FRACTION
+        for fraction in _IMAGE_CLICK_X_FRACTIONS:
+            points.append((int(x + width * fraction), int(click_y)))
+    return points
 
 
 def _iter_nodes(node: Any):
@@ -338,6 +393,34 @@ class X11Sender:
             self._click(*point)
             time.sleep(A11Y_RETRY_INTERVAL_SECONDS)
         raise X11SendError("无法把焦点切到微信输入框")
+
+    @serialized_send
+    def force_decode_image(
+        self, client: Any, chat_id: str, index: int = 0
+    ) -> bool:
+        """点开倒数第 ``index`` 张图片气泡，促使微信写出未加密副本。
+
+        返回是否真的点开了一张图片。点开后立即用 Esc 关闭查看器，避免影响
+        后续的发送流程。
+        """
+        self._ensure_chat_open(client, chat_id)
+        time.sleep(0.2)
+        tree = self._a11y(client)
+        points = _image_bubble_points(tree)
+        if index >= len(points):
+            return False
+
+        x, y = points[index]
+        self._click(x, y)
+        time.sleep(IMAGE_DECODE_WAIT_SECONDS)
+        try:
+            self._exec_script(
+                f"export DISPLAY={shlex.quote(self.display)}\n"
+                "xdotool key --clearmodifiers Escape\n"
+            )
+        finally:
+            time.sleep(0.15)
+        return True
 
     @serialized_send
     def send_text(self, client: Any, chat_id: str, text: str) -> None:

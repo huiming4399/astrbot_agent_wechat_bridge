@@ -65,59 +65,59 @@ ACTIVE_PROBE_FETCH_LIMIT = 2
 ACTIVE_PROBE_OPEN_CHAT = False
 ACTIVE_CHAT_KEEP = 8
 ACTIVE_CHAT_SEED = 2
-MEDIA_RETRY_ATTEMPTS = 4
+MEDIA_RETRY_ATTEMPTS = 8
 MEDIA_RETRY_INTERVAL_SECONDS = 0.25
+IMAGE_DECODE_MAX_CLICKS = 5
 SELF_ID_ALIAS_RE = re.compile(r"^(wxid_[^_]+)(?:_[0-9a-fA-F]{4,})$")
 
 CONFIG_METADATA = {
-    "en-US": {
-        "server_url": {
-            "label": "服务地址",
-            "help_text": "agent-wechat 的 REST API 地址，例如 http://localhost:6174。",
-            "field_type": "str",
-        },
-        "token": {
-            "label": "访问令牌",
-            "help_text": "若 agent-wechat 启用了鉴权，请填写终端执行 wx up 后得到的 token。",
-            "field_type": "str",
-            "secret": True,
-        },
-        "enable_x11_send_fallback": {
-            "label": "X11 兜底发送",
-            "help_text": (
-                "agent-wechat 接口返回 No action selected 时，"
-                "改用容器内 xdotool/xclip 直接发送文本消息。"
-            ),
-            "field_type": "bool",
-        },
-        "x11_send_mode": {
-            "label": "X11 发送模式",
-            "help_text": (
-                "always：文本消息直接走容器内 xdotool 发送，跳过已知不可用的接口；"
-                "fallback：先试接口，失败后再用 xdotool。"
-            ),
-            "field_type": "str",
-            "options": ["always", "fallback"],
-        },
-        "x11_docker_container": {
-            "label": "微信容器名",
-            "help_text": "运行微信的 agent-wechat 容器名称，默认 agent-wechat。",
-            "field_type": "str",
-        },
-        "x11_display": {
-            "label": "容器内 DISPLAY",
-            "help_text": "容器内 X 显示编号，默认 :99。",
-            "field_type": "str",
-        },
-        "group_mention_free_senders": {
-            "label": "群聊免@成员",
-            "help_text": (
-                "填 wxid（多个用逗号或换行分隔）。名单里的成员在群里发言无需 @ 机器人；"
-                "其他人仍然必须 @ 机器人才会回复。留空表示群里所有人都要 @。"
-            ),
-            "field_type": "str",
-        },
-    }
+    "server_url": {
+        "description": "服务地址",
+        "type": "string",
+        "hint": "agent-wechat 的 REST API 地址，例如 http://localhost:6174。",
+    },
+    "token": {
+        "description": "访问令牌",
+        "type": "string",
+        "hint": "若 agent-wechat 启用了鉴权，请填写终端执行 wx up 后得到的 token。",
+        "secret": True,
+        "show_key": True,
+    },
+    "enable_x11_send_fallback": {
+        "description": "X11 兜底发送",
+        "type": "bool",
+        "hint": (
+            "agent-wechat 接口返回 No action selected 时，"
+            "改用容器内 xdotool/xclip 直接发送文本消息。"
+        ),
+    },
+    "x11_send_mode": {
+        "description": "X11 发送模式",
+        "type": "string",
+        "options": ["always", "fallback"],
+        "labels": ["always：文本直接走容器内 X11", "fallback：先试接口，失败再兜底"],
+        "hint": "always 会跳过已知不可用的 /api/messages/send。",
+    },
+    "x11_docker_container": {
+        "description": "微信容器名",
+        "type": "string",
+        "hint": "运行微信的 agent-wechat 容器名称，默认 agent-wechat。",
+    },
+    "x11_display": {
+        "description": "容器内 DISPLAY",
+        "type": "string",
+        "hint": "容器内 X 显示编号，默认 :99。",
+    },
+    "group_mention_free_senders": {
+        "description": "群聊免@成员",
+        "type": "string",
+        "hint": (
+            "填 wxid，多个用逗号或换行分隔。名单里的成员在群里发言无需 @ 机器人；"
+            "其他人仍然必须 @ 机器人才会回复。留空表示群里所有人都要 @。"
+            "注意：群里没 @ 机器人的消息不会被丢弃，仍会作为群聊上下文进入 AstrBot，"
+            "只是不触发回复。"
+        ),
+    },
 }
 
 DEFAULT_CONFIG = {
@@ -127,7 +127,7 @@ DEFAULT_CONFIG = {
     "x11_send_mode": "always",
     "x11_docker_container": "agent-wechat",
     "x11_display": ":99",
-    "group_mention_free_senders": [],
+    "group_mention_free_senders": "",
 }
 
 
@@ -1002,12 +1002,35 @@ class AgentWeChatPlatformAdapter(Platform):
             f"session={session_id}"
         )
 
+    async def _force_decode_image(self, chat_id: str, index: int) -> bool:
+        """点开会话里的图片气泡，促使微信写出未加密的图片副本。
+
+        微信收到的图片在本地是加密的 ``.dat``，只有真正渲染过才会在临时目录
+        留下可读副本。这里驱动一次界面点击，让微信解码后再重新取一次媒体。
+        """
+        sender = getattr(self.client, "x11_sender", None)
+        if sender is None:
+            return False
+        try:
+            opened = await asyncio.to_thread(
+                sender.force_decode_image, self.client, chat_id, index
+            )
+        except Exception as exc:  # noqa: BLE001 - 解码失败时保持原有降级行为
+            logger.debug(f"[agent_wechat] 促发图片解码失败 {chat_id}: {exc}")
+            return False
+        if opened:
+            logger.info(
+                f"[agent_wechat] 已打开 {chat_id} 的图片触发微信解码，重新获取媒体"
+            )
+        return bool(opened)
+
     async def _download_media(
         self,
         chat_id: str,
         local_id: int,
     ) -> tuple[str, str, str] | None:
         result: dict[str, Any] | None = None
+        decode_index = 0
         for attempt in range(MEDIA_RETRY_ATTEMPTS):
             try:
                 candidate = await asyncio.to_thread(
@@ -1029,6 +1052,16 @@ class AgentWeChatPlatformAdapter(Platform):
             if candidate.get("data"):
                 result = candidate
                 break
+            # 收到的图片在本地是加密 .dat，只有微信渲染过才会写出未加密副本。
+            if (
+                candidate.get("type") == "image"
+                and decode_index < IMAGE_DECODE_MAX_CLICKS
+                and await self._force_decode_image(chat_id, decode_index)
+            ):
+                decode_index += 1
+                await asyncio.sleep(MEDIA_RETRY_INTERVAL_SECONDS)
+                continue
+
             if attempt < MEDIA_RETRY_ATTEMPTS - 1 and MEDIA_RETRY_INTERVAL_SECONDS > 0:
                 # 上游媒体落库可能有延迟，短暂等待后重试。
                 await asyncio.sleep(MEDIA_RETRY_INTERVAL_SECONDS)

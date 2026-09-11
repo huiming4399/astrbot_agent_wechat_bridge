@@ -117,6 +117,7 @@ AstrBot 加载插件后，在平台管理中添加 `agent_wechat`，配置项如
 - 群里既没 @ 机器人、又不在免@名单里的消息不会注入 `At(self_id)`，因此不会触发回复；
   但它仍会流经 AstrBot，群聊上下文照常可用
 - 想让大模型真正「看到」群里没 @ 它的对话，需要在 AstrBot 里开启 `provider_ltm_settings.group_icl_enable`
+  （WebUI：配置 → 模型/长期记忆设置 → 群聊上下文，打开后这些消息会以 `<system_reminder>` 形式注入下一次请求）
 
 也可以直接在 `cmd_config.json` 的 `platform` 数组里确保存在如下项：
 

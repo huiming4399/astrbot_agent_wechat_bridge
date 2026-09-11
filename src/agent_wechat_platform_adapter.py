@@ -47,7 +47,14 @@ MSG_TYPE_IMAGE = 3
 MSG_TYPE_VOICE = 34
 MSG_TYPE_VIDEO = 43
 MSG_TYPE_APP = 49
-MEDIA_TYPES = {MSG_TYPE_IMAGE, MSG_TYPE_VOICE, MSG_TYPE_VIDEO, MSG_TYPE_APP}
+MSG_TYPE_EMOJI = 47
+MEDIA_TYPES = {
+    MSG_TYPE_IMAGE,
+    MSG_TYPE_VOICE,
+    MSG_TYPE_VIDEO,
+    MSG_TYPE_APP,
+    MSG_TYPE_EMOJI,
+}
 
 # 仅保留 server_url / token 为可配置项，其余行为采用固定策略。
 POLL_INTERVAL_MS = 200
@@ -915,6 +922,12 @@ class AgentWeChatPlatformAdapter(Platform):
             else raw_text.strip()
         )
 
+        base_type = int(message.get("type", 0) or 0) & 0x7FFFFFFF
+        if base_type == MSG_TYPE_EMOJI:
+            # 表情消息的正文是 CDN 链接，对模型没有意义；真正的图片由取媒体
+            # 流程下载后作为 Image 组件送入。
+            normalized_text = ""
+
         components: list[Any] = []
         message_str_parts: list[str] = []
 
@@ -927,7 +940,6 @@ class AgentWeChatPlatformAdapter(Platform):
             components.append(Plain(text=normalized_text))
             message_str_parts.append(normalized_text)
 
-        base_type = int(message.get("type", 0) or 0) & 0x7FFFFFFF
         if base_type in MEDIA_TYPES:
             media = await self._download_media(
                 chat_id, int(message.get("localId", 0) or 0)
@@ -942,6 +954,12 @@ class AgentWeChatPlatformAdapter(Platform):
                         message_str_parts.append("<media:audio>")
                     else:
                         message_str_parts.append(f"[file:{filename}]")
+
+        if base_type == MSG_TYPE_EMOJI and not message_str_parts:
+            # 表情下载失败时至少让模型知道对方发了个表情。
+            fallback = "[表情]"
+            components.append(Plain(text=fallback))
+            message_str_parts.append(fallback)
 
         reply = message.get("reply")
         if isinstance(reply, dict) and reply.get("content"):

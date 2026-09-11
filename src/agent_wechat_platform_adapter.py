@@ -30,6 +30,8 @@ from .agent_wechat_access import (
     is_group_chat,
     is_leading_self_mention,
     is_official_account,
+    normalize_allowlist,
+    should_wake_group_message,
     strip_leading_mentions,
 )
 from .agent_wechat_client import (
@@ -107,6 +109,14 @@ CONFIG_METADATA = {
             "help_text": "容器内 X 显示编号，默认 :99。",
             "field_type": "str",
         },
+        "group_mention_free_senders": {
+            "label": "群聊免@成员",
+            "help_text": (
+                "填 wxid（多个用逗号或换行分隔）。名单里的成员在群里发言无需 @ 机器人；"
+                "其他人仍然必须 @ 机器人才会回复。留空表示群里所有人都要 @。"
+            ),
+            "field_type": "str",
+        },
     }
 }
 
@@ -117,6 +127,7 @@ DEFAULT_CONFIG = {
     "x11_send_mode": "always",
     "x11_docker_container": "agent-wechat",
     "x11_display": ":99",
+    "group_mention_free_senders": [],
 }
 
 
@@ -214,6 +225,9 @@ class AgentWeChatPlatformAdapter(Platform):
         self.client.x11_send_mode = str(
             self.config.get("x11_send_mode") or "always"
         ).strip() or "always"
+        self.group_mention_free_senders = normalize_allowlist(
+            self.config.get("group_mention_free_senders")
+        )
         self.shutdown_event = asyncio.Event()
         self.sync_event = asyncio.Event()
         self.last_seen_id: dict[str, int] = {}
@@ -874,13 +888,28 @@ class AgentWeChatPlatformAdapter(Platform):
         )
         is_group = is_group_chat(chat_id) or bool(chat.get("isGroup"))
         raw_text = str(message.get("content") or "")
-        is_mentioned = bool(message.get("isMentioned"))
-        if is_group and not is_mentioned and raw_text:
+        mentioned = bool(message.get("isMentioned"))
+        leading_self_mention = False
+        if is_group and not mentioned and raw_text:
             # 某些上游场景下 isMentioned 可能缺失；用消息开头 @ 与机器人别名做兜底匹配。
-            is_mentioned = is_leading_self_mention(raw_text, self.self_aliases)
-        if is_group:
-            # 当前桥接策略：群聊默认自动唤醒，不再要求显式 @ 机器人。
-            is_mentioned = True
+            leading_self_mention = is_leading_self_mention(
+                raw_text, self.self_aliases
+            )
+        if is_group and not should_wake_group_message(
+            sender_id=sender_id,
+            mentioned=mentioned,
+            leading_self_mention=leading_self_mention,
+            mention_free_senders=self.group_mention_free_senders,
+        ):
+            # 群里既没 @ 机器人、又不在免@名单里的消息，直接忽略，不交给 AstrBot。
+            logger.info(
+                f"[agent_wechat] 群聊消息未 @ 机器人且发送者不在免@名单，已忽略 "
+                f"chat={chat_id} sender={sender_id}"
+            )
+            return None
+        # 能走到这里说明群消息已经通过唤醒判定（被 @ 或发送者在免@名单里），
+        # 统一按“已唤醒”处理，交给 AstrBot 继续走对话链路。
+        is_mentioned = is_group or mentioned or leading_self_mention
         normalized_text = (
             strip_leading_mentions(raw_text) if is_group else raw_text.strip()
         )

@@ -8,6 +8,7 @@ DM_POLICIES = {"open", "allowlist", "disabled"}
 GROUP_POLICIES = {"open", "allowlist", "disabled"}
 INVISIBLE_TEXT_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f]")
 MENTION_SPLIT_RE = re.compile(r"[\u2005\s]+")
+LIST_SPLIT_RE = re.compile(r"[,;\uff0c\uff1b\u3001\s]+")
 
 
 def normalize_wechat_id(raw: str | None) -> str:
@@ -16,7 +17,14 @@ def normalize_wechat_id(raw: str | None) -> str:
     return raw.strip().removeprefix("wechat:").strip()
 
 
-def normalize_allowlist(values: list[str] | None) -> list[str]:
+def normalize_allowlist(values: list[str] | str | None) -> list[str]:
+    """归一化 wxid 名单。
+
+    既接受列表，也接受用逗号/分号/空白分隔的字符串（方便 WebUI 里直接手填）。
+    """
+
+    if isinstance(values, str):
+        values = [item for item in LIST_SPLIT_RE.split(values) if item]
     result: list[str] = []
     for value in values or []:
         normalized = normalize_wechat_id(str(value))
@@ -102,6 +110,25 @@ def is_sender_allowed(sender_id: str | None, allowlist: list[str]) -> bool:
     if not normalized_sender:
         return False
     return normalized_sender in allowlist
+
+
+def should_wake_group_message(
+    *,
+    sender_id: str | None,
+    mentioned: bool,
+    leading_self_mention: bool = False,
+    mention_free_senders: list[str] | None = None,
+) -> bool:
+    """群聊里这条消息是否需要唤醒机器人。
+
+    被 @（上游 ``isMentioned``）或消息开头 @ 了机器人别名，一律唤醒；
+    除此之外，只有 ``mention_free_senders`` 名单里的成员可以不 @ 直接唤醒。
+    名单为空时，群里所有人都必须 @ 机器人才会回复。
+    """
+
+    if mentioned or leading_self_mention:
+        return True
+    return is_sender_allowed(sender_id, mention_free_senders or [])
 
 
 def should_forward_message(

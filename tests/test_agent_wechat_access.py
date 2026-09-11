@@ -6,6 +6,7 @@ from src.agent_wechat_access import (
     normalize_allowlist,
     normalize_wechat_id,
     should_forward_message,
+    should_wake_group_message,
     strip_leading_mentions,
 )
 
@@ -74,3 +75,52 @@ def test_should_block_group_without_mention() -> None:
     )
     assert allowed is False
     assert reason == "mention_required"
+
+
+def test_normalize_allowlist_accepts_delimited_string() -> None:
+    assert normalize_allowlist("wxid_a, wxid_b") == ["wxid_a", "wxid_b"]
+    assert normalize_allowlist("wechat:wxid_a\nwxid_b；wxid_a") == ["wxid_a", "wxid_b"]
+    assert normalize_allowlist("") == []
+    assert normalize_allowlist(None) == []
+
+
+def test_should_wake_group_message_when_mentioned() -> None:
+    assert should_wake_group_message(
+        sender_id="wxid_other",
+        mentioned=True,
+        mention_free_senders=[],
+    )
+
+
+def test_should_wake_group_message_when_leading_mention() -> None:
+    assert should_wake_group_message(
+        sender_id="wxid_other",
+        mentioned=False,
+        leading_self_mention=True,
+        mention_free_senders=[],
+    )
+
+
+def test_should_wake_group_message_only_for_allowlisted_sender() -> None:
+    free = ["wxid_me"]
+    assert should_wake_group_message(
+        sender_id="wxid_me", mentioned=False, mention_free_senders=free
+    )
+    assert not should_wake_group_message(
+        sender_id="wxid_other", mentioned=False, mention_free_senders=free
+    )
+    assert not should_wake_group_message(
+        sender_id="wxid_other", mentioned=False, mention_free_senders=[]
+    )
+
+
+def test_should_wake_group_message_supports_message_member_prefix() -> None:
+    assert should_wake_group_message(
+        sender_id="wechat:wxid_me", mentioned=False, mention_free_senders=["wxid_me"]
+    )
+
+
+def test_should_wake_group_message_wildcard_keeps_legacy_behaviour() -> None:
+    assert should_wake_group_message(
+        sender_id="wxid_anyone", mentioned=False, mention_free_senders=["*"]
+    )

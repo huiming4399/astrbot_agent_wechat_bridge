@@ -88,6 +88,7 @@ AstrBot 加载插件后，在平台管理中添加 `agent_wechat`，配置项如
 | `x11_send_mode` | `always` | `always`：文本消息直接走 X11；`fallback`：先试接口，失败后再走 X11 |
 | `x11_docker_container` | `agent-wechat` | 运行微信的容器名称 |
 | `x11_display` | `:99` | 容器内的 X 显示编号 |
+| `group_mention_free_senders` | 空 | 群聊免@成员 wxid 列表，名单里的人发言无需 @ 机器人 |
 
 ### 关于发送通道
 
@@ -112,7 +113,8 @@ AstrBot 加载插件后，在平台管理中添加 `agent_wechat`，配置项如
 - 热路径超时：`800ms`
 - 媒体重试：`4` 次，每次间隔 `250ms`
 - 消息转发策略：私聊/群聊均默认转发，不再提供白名单与 `@` 触发配置项
-- 群聊触发策略：默认自动唤醒，群内消息不加 `@` 也会触发机器人回复
+- 群聊触发策略：默认**需要 @ 机器人**；`group_mention_free_senders` 名单里的成员可以不 @ 直接触发，其他人必须 @
+- 群里既没 @ 机器人、又不在免@名单里的消息会被插件直接忽略，不进入 AstrBot
 
 也可以直接在 `cmd_config.json` 的 `platform` 数组里确保存在如下项：
 

@@ -13,6 +13,8 @@ import shlex
 import subprocess
 import tempfile
 import time
+import threading
+from functools import wraps
 from typing import Any
 
 from astrbot.api import logger
@@ -28,6 +30,15 @@ STEP_TIMEOUT_SECONDS = 30.0
 A11Y_RETRY_ATTEMPTS = 12
 A11Y_RETRY_INTERVAL_SECONDS = 0.12
 STATE_WAIT_ATTEMPTS = 25
+_SEND_LOCK = threading.RLock()
+
+
+def serialized_send(method):
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        with _SEND_LOCK:
+            return method(*args, **kwargs)
+    return wrapped
 
 
 class X11SendError(RuntimeError):
@@ -147,8 +158,6 @@ class X11Sender:
     ) -> None:
         self.container = (container or DEFAULT_CONTAINER).strip()
         self.display = (display or DEFAULT_DISPLAY).strip()
-        self._display_name_cache: dict[str, str] = {}
-        self._active_chat_id: str | None = None
 
     # ------------------------------------------------------------------ 底层
 
@@ -248,9 +257,6 @@ class X11Sender:
     # ------------------------------------------------------------------ 流程
 
     def _resolve_display_name(self, client: Any, chat_id: str) -> str | None:
-        cached = self._display_name_cache.get(chat_id)
-        if cached:
-            return cached
         try:
             chat = client.get_chat(chat_id)
         except Exception as exc:  # noqa: BLE001
@@ -259,7 +265,6 @@ class X11Sender:
         if isinstance(chat, dict):
             name = str(chat.get("name") or "").strip()
             if name:
-                self._display_name_cache[chat_id] = name
                 return name
         try:
             for item in client.list_chats(limit=200):
@@ -268,60 +273,44 @@ class X11Sender:
                 ) == chat_id:
                     name = str(item.get("name") or "").strip()
                     if name:
-                        self._display_name_cache[chat_id] = name
                         return name
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"{X11_LOG_PREFIX} list_chats 失败: {exc}")
         return None
 
-    def _ensure_chat_open(self, client: Any, chat_id: str) -> None:
-        # A decorated reply can send text and an image back-to-back.  WeChat
-        # may refresh the chat list between those sends and temporarily omit
-        # the just-selected group; retain the confirmed selection locally.
-        if self._active_chat_id == chat_id:
-            return
+    def _ensure_chat_open(self, client: Any, chat_id: str, *, allow_switch: bool = True) -> None:
         display_name = self._resolve_display_name(client, chat_id)
-        if not display_name:
-            raise X11SendError(f"无法解析会话 {chat_id} 的显示名称")
+        if not display_name or display_name == chat_id:
+            raise X11SendError(f"无法确认会话 {chat_id} 的真实名称，已停止发送")
+        chats = client.list_chats(limit=-1)
+        owners = [c for c in chats if c.get("name") == display_name]
+        if len(owners) != 1 or str(owners[0].get("id")) != chat_id:
+            raise X11SendError("会话名称不唯一，无法确认发送对象")
 
         for _ in range(A11Y_RETRY_ATTEMPTS):
             tree = self._a11y(client)
             items = find_chat_list_items(tree)
             if not items:
                 raise X11SendError("无障碍树里没有会话列表，微信窗口状态异常")
-            target = match_chat_item(items, display_name)
-            # Newly joined/group chats may be returned by agent-wechat with the
-            # raw ``@chatroom`` id instead of their display name.  WeChat's
-            # visible row still contains the latest message preview, so use it
-            # as a stable secondary locator.
-            if target is None and chat_id.endswith("@chatroom"):
-                try:
-                    messages = client.list_messages(chat_id, limit=8)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        f"{X11_LOG_PREFIX} list group messages failed chat={chat_id}: {exc}"
-                    )
-                    messages = []
-                previews = [
-                    str(message.get("content") or "").strip()
-                    for message in reversed(messages)
-                    if isinstance(message, dict)
-                ]
-                previews = [preview for preview in previews if preview]
-                matches = [
-                    item
-                    for item in items
-                    if any(preview in str(item.get("name") or "") for preview in previews)
-                ]
-                if len(matches) == 1:
-                    target = matches[0]
+            matches = []
+            for item in items:
+                label = str(item.get("name") or "").strip()
+                candidates = [c for c in chats if c.get("name") and
+                              (label == c["name"] or label.startswith(c["name"] + " "))]
+                if candidates:
+                    longest = max(len(c["name"]) for c in candidates)
+                    candidates = [c for c in candidates if len(c["name"]) == longest]
+                    if len(candidates) == 1 and candidates[0].get("id") == chat_id:
+                        matches.append(item)
+            target = matches[0] if len(matches) == 1 else None
             if target is None:
                 raise X11SendError(
                     f"会话列表里找不到「{display_name}」，它可能不在可视区域内"
                 )
             if _has_state(target, "SELECTED"):
-                self._active_chat_id = chat_id
                 return
+            if not allow_switch:
+                raise X11SendError("发送前会话已切换，已停止发送")
             point = _center(target.get("bounds"))
             if point is None:
                 raise X11SendError(f"会话「{display_name}」坐标不可用")
@@ -333,13 +322,6 @@ class X11Sender:
     def _focus_composer(
         self, client: Any
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        # Search suggestions can remain open after a manual lookup and obscure
-        # the chat composer.  Escape is harmless in the normal chat view and
-        # restores the composer before locating it.
-        self._exec_script(
-            f"export DISPLAY={shlex.quote(self.display)}\n"
-            "xdotool key --clearmodifiers Escape\n"
-        )
         for _ in range(A11Y_RETRY_ATTEMPTS):
             tree = self._a11y(client)
             pair = find_composer(tree)
@@ -357,6 +339,7 @@ class X11Sender:
             time.sleep(A11Y_RETRY_INTERVAL_SECONDS)
         raise X11SendError("无法把焦点切到微信输入框")
 
+    @serialized_send
     def send_text(self, client: Any, chat_id: str, text: str) -> None:
         """在容器内模拟人工操作，把 ``text`` 发送到 ``chat_id``。"""
         if not text:
@@ -393,6 +376,7 @@ class X11Sender:
             if point is None:
                 raise X11SendError("发送按钮坐标不可用")
 
+            self._ensure_chat_open(client, chat_id, allow_switch=False)
             self._click(*point)
 
             if not self._wait_send_button(client, disabled=True):
@@ -404,6 +388,7 @@ class X11Sender:
                 except OSError:
                     pass
 
+    @serialized_send
     def send_image(self, client: Any, chat_id: str, image: dict[str, Any]) -> None:
         """在容器内把图片粘贴到当前微信会话并发送。"""
         encoded = image.get("data")
@@ -414,7 +399,7 @@ class X11Sender:
         host_path = None
         try:
             with tempfile.NamedTemporaryFile("wb", suffix=".img", delete=False) as handle:
-                handle.write(base64.b64decode(encoded))
+                handle.write(base64.b64decode(encoded, validate=True))
                 host_path = handle.name
             self._ensure_chat_open(client, chat_id)
             pair = self._focus_composer(client)
@@ -431,6 +416,7 @@ class X11Sender:
             point = _center(pair[1].get("bounds"))
             if point is None:
                 raise X11SendError("发送按钮坐标不可用")
+            self._ensure_chat_open(client, chat_id, allow_switch=False)
             self._click(*point)
             if not self._wait_send_button(client, disabled=True):
                 raise X11SendError("发送图片后输入框未清空")

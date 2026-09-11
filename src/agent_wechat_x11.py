@@ -24,9 +24,9 @@ DEFAULT_DISPLAY = ":99"
 CONTAINER_TEXT_PATH = "/tmp/astrbot_outbound.txt"
 
 STEP_TIMEOUT_SECONDS = 30.0
-A11Y_RETRY_ATTEMPTS = 8
-A11Y_RETRY_INTERVAL_SECONDS = 0.4
-STATE_WAIT_ATTEMPTS = 10
+A11Y_RETRY_ATTEMPTS = 12
+A11Y_RETRY_INTERVAL_SECONDS = 0.12
+STATE_WAIT_ATTEMPTS = 25
 
 
 class X11SendError(RuntimeError):
@@ -146,6 +146,7 @@ class X11Sender:
     ) -> None:
         self.container = (container or DEFAULT_CONTAINER).strip()
         self.display = (display or DEFAULT_DISPLAY).strip()
+        self._display_name_cache: dict[str, str] = {}
 
     # ------------------------------------------------------------------ 底层
 
@@ -210,24 +211,32 @@ class X11Sender:
             raise X11SendError("无障碍树为空，微信窗口可能尚未就绪")
         return tree
 
-    def _send_button_disabled(self, client: Any) -> bool | None:
-        tree = self._a11y(client)
-        pair = find_composer(tree)
+    def _composer_state(
+        self, client: Any
+    ) -> tuple[tuple[dict[str, Any], dict[str, Any]] | None, bool | None]:
+        """返回 (输入框/发送按钮节点对, 发送按钮是否禁用)。"""
+        pair = find_composer(self._a11y(client))
         if pair is None:
-            return None
-        return _has_state(pair[1], "DISABLED")
+            return None, None
+        return pair, _has_state(pair[1], "DISABLED")
 
-    def _wait_send_button(self, client: Any, *, disabled: bool) -> bool:
+    def _wait_send_button(
+        self, client: Any, *, disabled: bool
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """轮询发送按钮状态，命中时连同节点坐标一起返回，省掉一次无障碍树请求。"""
         for _ in range(STATE_WAIT_ATTEMPTS):
-            state = self._send_button_disabled(client)
-            if state is disabled:
-                return True
+            pair, state = self._composer_state(client)
+            if state is disabled and pair is not None:
+                return pair
             time.sleep(A11Y_RETRY_INTERVAL_SECONDS)
-        return False
+        return None
 
     # ------------------------------------------------------------------ 流程
 
     def _resolve_display_name(self, client: Any, chat_id: str) -> str | None:
+        cached = self._display_name_cache.get(chat_id)
+        if cached:
+            return cached
         try:
             chat = client.get_chat(chat_id)
         except Exception as exc:  # noqa: BLE001
@@ -236,6 +245,7 @@ class X11Sender:
         if isinstance(chat, dict):
             name = str(chat.get("name") or "").strip()
             if name:
+                self._display_name_cache[chat_id] = name
                 return name
         try:
             for item in client.list_chats(limit=200):
@@ -244,6 +254,7 @@ class X11Sender:
                 ) == chat_id:
                     name = str(item.get("name") or "").strip()
                     if name:
+                        self._display_name_cache[chat_id] = name
                         return name
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"{X11_LOG_PREFIX} list_chats 失败: {exc}")
@@ -274,7 +285,9 @@ class X11Sender:
 
         raise X11SendError(f"点击会话「{display_name}」后仍未进入已选中状态")
 
-    def _focus_composer(self, client: Any) -> None:
+    def _focus_composer(
+        self, client: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         for _ in range(A11Y_RETRY_ATTEMPTS):
             tree = self._a11y(client)
             pair = find_composer(tree)
@@ -283,7 +296,7 @@ class X11Sender:
                 continue
             edit_node = pair[0]
             if _has_state(edit_node, "FOCUSED"):
-                return
+                return pair
             point = _center(edit_node.get("bounds"))
             if point is None:
                 time.sleep(A11Y_RETRY_INTERVAL_SECONDS)
@@ -298,9 +311,9 @@ class X11Sender:
             return
 
         self._ensure_chat_open(client, chat_id)
-        self._focus_composer(client)
+        pair = self._focus_composer(client)
 
-        if self._send_button_disabled(client) is False:
+        if _has_state(pair[1], "DISABLED") is False:
             raise X11SendError("微信输入框里仍有未发送的内容，为避免串消息已中止")
 
         host_path = None
@@ -312,24 +325,21 @@ class X11Sender:
                 host_path = handle.name
             self._copy_text_into_container(host_path)
 
-            pair = find_composer(self._a11y(client))
-            if pair is None:
-                raise X11SendError("发送前输入框消失")
-            point = _center(pair[1].get("bounds"))
-            if point is None:
-                raise X11SendError("发送按钮坐标不可用")
-
             self._exec_script(
                 f"export DISPLAY={shlex.quote(self.display)}\n"
                 f"setsid xclip -selection clipboard -i {CONTAINER_TEXT_PATH} "
                 f"</dev/null >/dev/null 2>&1 &\n"
-                "sleep 0.5\n"
+                "sleep 0.25\n"
                 "xdotool key --clearmodifiers ctrl+v\n"
-                "sleep 0.8\n"
             )
 
-            if not self._wait_send_button(client, disabled=False):
+            pair = self._wait_send_button(client, disabled=False)
+            if pair is None:
                 raise X11SendError("粘贴后发送按钮仍未激活，文本可能没有进入输入框")
+
+            point = _center(pair[1].get("bounds"))
+            if point is None:
+                raise X11SendError("发送按钮坐标不可用")
 
             self._click(*point)
 

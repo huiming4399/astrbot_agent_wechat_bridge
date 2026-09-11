@@ -333,6 +333,13 @@ class X11Sender:
     def _focus_composer(
         self, client: Any
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        # Search suggestions can remain open after a manual lookup and obscure
+        # the chat composer.  Escape is harmless in the normal chat view and
+        # restores the composer before locating it.
+        self._exec_script(
+            f"export DISPLAY={shlex.quote(self.display)}\n"
+            "xdotool key --clearmodifiers Escape\n"
+        )
         for _ in range(A11Y_RETRY_ATTEMPTS):
             tree = self._a11y(client)
             pair = find_composer(tree)
